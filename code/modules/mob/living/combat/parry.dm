@@ -19,9 +19,6 @@
 		else
 			prob2defend = max(prob2defend-15,0)
 
-//	if(!cmode) // not currently used, see cmode check above
-//		prob2defend = max(prob2defend-15,0)
-
 	if(m_intent == MOVE_INTENT_RUN)
 		prob2defend = max(prob2defend-15,0)
 
@@ -30,6 +27,7 @@
 	if(pulledby || pulling)
 		return FALSE
 
+	// Parry/block cooldown: slightly higher than dodge cooldown
 	var/parrydelay = setparrytime
 	parrydelay -= get_tempo_bonus(TEMPO_TAG_PARRYCD_BONUS)
 	if(world.time < last_parry + parrydelay)
@@ -184,12 +182,13 @@
 		if(HAS_TRAIT(U, TRAIT_FENCERDEXTERITY))
 			prob2defend -= 5
 
-	prob2defend = clamp(prob2defend, 5, 90)
+	// Skill cap raised to 99% (only 1% chance to fail)
+	prob2defend = clamp(prob2defend, 5, 99)
 	if(HAS_TRAIT(user, TRAIT_HARDSHELL) && H.client)	//Dwarf-merc specific limitation w/ their armor on in pvp
 		prob2defend = clamp(prob2defend, 5, 70)
 	var/untrained_armor = FALSE
 	if(!H?.check_armor_skill())
-		prob2defend = clamp(prob2defend, 5, 75)			//Caps your max parry to 75 if using armor you're not trained in. Bad dexerity.
+		prob2defend = clamp(prob2defend, 5, 75)			//Caps your max parry to 75 if using armor you're not trained in. Bad dexterity.
 		drained = drained + 5							//More stamina usage for not being trained in the armor you're using.
 		untrained_armor = TRUE
 
@@ -212,13 +211,22 @@
 	if(HAS_TRAIT(src, TRAIT_NODEF))
 		prob2defend = 0
 
+	// Roll and determine parry outcome tier
+	var/roll = rand(1, 100)
 	var/parry_status = FALSE
 	if(defender_dualw)
-		if(prob(prob2defend) && extradefroll)
+		if(roll <= prob2defend && extradefroll)
 			parry_status = TRUE
 	else
-		if(prob(prob2defend))
+		if(roll <= prob2defend)
 			parry_status = TRUE
+
+	// Determine if this is a "clean" block (rolled <= half of prob2defend, rounded up)
+	var/clean_block = FALSE
+	if(parry_status)
+		var/half_chance = round(prob2defend / 2, 1)
+		if(roll <= half_chance)
+			clean_block = TRUE
 
 	if(parry_status)
 		if(intenty.masteritem)
@@ -246,7 +254,9 @@
 		attacker_skill_type = /datum/skill/combat/unarmed
 
 	if(weapon_parry == TRUE)
-		if(do_parry(used_weapon, drained, user, untrained_armor)) //show message
+		// Weapon durability damage from the parry — scaled by attacker damage and pen, reduced by defender skill
+		// If clean_block (rolled <= half prob2defend), weapon takes no durability damage
+		if(do_parry(used_weapon, drained, user, untrained_armor, clean_block)) //show message
 			//only gain experience if attacker and defender aren't using non-combat skills for their weapons
 			if(ispath(attacker_skill_type, /datum/skill/combat) && ispath(used_weapon.associated_skill, /datum/skill/combat))
 				if ((mobility_flags & MOBILITY_STAND))
@@ -282,41 +292,52 @@
 			else
 				flash_fullscreen("blackflash2")
 
-			if(AB)
-				var/dam2take = round((get_complex_damage(AB,user,used_weapon.blade_dulling)/2),1)
-				if(dam2take)
-					var/intdam = used_weapon.max_blade_int ? INTEG_PARRY_DECAY : INTEG_PARRY_DECAY_NOSHARP
-					var/sharp_loss = SHARPNESS_ONHIT_DECAY
-					if(used_weapon == offhand)
-						intdam = INTEG_PARRY_DECAY_NOSHARP
-
-					if(istype(user.rmb_intent, /datum/rmb_intent/strong))
-						sharp_loss += STRONG_SHP_BONUS
-						intdam += STRONG_INTG_BONUS
-
-					// Heavy weapons chew through shields — use higher of demolition_mod or intent intdamage_factor
-					if(istype(used_weapon, /obj/item/rogueweapon/shield) && intenty)
-						var/shield_mult = max(intenty.demolition_mod, intenty.intent_intdamage_factor)
-						intdam *= shield_mult
-
-					var/tempobonus = H.get_tempo_bonus(TEMPO_TAG_DEF_INTEGFACTOR)
-					if(tempobonus)	//It is either null or 0.1 to 1, multiplication by null results in 0, so we check.
-						intdam *= tempobonus
-
-					used_weapon.take_damage(intdam, BRUTE, used_weapon.d_type)
-					used_weapon.remove_bintegrity(sharp_loss, user)
-			else
-				// Unarmed attacker
-				var/intdam = INTEG_PARRY_DECAY_UNARMED
+			if(AB && !clean_block)
+				// Weapon durability damage based on attacker's damage and pen, reduced by defender skill
+				var/atk_damage = get_complex_damage(AB, user, used_weapon.blade_dulling)
+				var/atk_pen = AB.armor_penetration
+				// Base integrity damage = attacker damage, scaled by penetration
+				var/intdam = round(atk_damage * (1 + (atk_pen / 100)), 1)
+				// Defender skill with their weapon reduces durability damage taken
+				var/skill_reduction = clamp(defender_skill * 0.1, 0, 0.8) // up to 80% reduction at high skill
+				intdam = max(round(intdam * (1 - skill_reduction), 1), 1)
+				// Apply extra sharpness modifiers from intent
+				var/sharp_loss = SHARPNESS_ONHIT_DECAY
+				if(used_weapon == offhand)
+					intdam = round(intdam * 0.75, 1) // offhand takes slightly less damage
+				if(istype(user.rmb_intent, /datum/rmb_intent/strong))
+					sharp_loss += STRONG_SHP_BONUS
+					intdam = round(intdam * 1.25, 1)
+				// Heavy weapons chew through shields
 				if(istype(used_weapon, /obj/item/rogueweapon/shield) && intenty)
-					intdam *= intenty.intent_intdamage_factor
+					var/shield_mult = max(intenty.demolition_mod, intenty.intent_intdamage_factor)
+					intdam = round(intdam * shield_mult, 1)
+				var/tempobonus = H.get_tempo_bonus(TEMPO_TAG_DEF_INTEGFACTOR)
+				if(tempobonus)
+					intdam = round(intdam * tempobonus, 1)
 				used_weapon.take_damage(intdam, BRUTE, used_weapon.d_type)
+				used_weapon.remove_bintegrity(sharp_loss, user)
+			else if(AB && clean_block)
+				// Clean block: weapon takes no durability damage
+				var/sharp_loss = SHARPNESS_ONHIT_DECAY
+				if(istype(user.rmb_intent, /datum/rmb_intent/strong))
+					sharp_loss += STRONG_SHP_BONUS
+				used_weapon.remove_bintegrity(sharp_loss, user) // still loses some sharpness but no structural damage
+			else if(!AB)
+				// Unarmed attacker: minimal weapon damage
+				if(!clean_block)
+					var/intdam = INTEG_PARRY_DECAY_UNARMED
+					if(istype(used_weapon, /obj/item/rogueweapon/shield) && intenty)
+						intdam = round(intdam * intenty.intent_intdamage_factor, 1)
+					used_weapon.take_damage(intdam, BRUTE, used_weapon.d_type)
 			return TRUE
 		else
 			return FALSE
 
 	if(weapon_parry == FALSE)
-		if(do_unarmed_parry(drained, user, untrained_armor))
+		// Unarmed block: on success, deal damage to attacker's arms; on clean block, no arm damage to defender
+		// Pass clean_block and unarmed_skill info to do_unarmed_parry for the block outcome
+		if(do_unarmed_parry(drained, user, untrained_armor, unarmed_skill, clean_block))
 			//only gain experience if attacker isn't using a non-combat skill for their weapon
 			if(ispath(attacker_skill_type, /datum/skill/combat))
 				if((mobility_flags & MOBILITY_STAND))
@@ -328,19 +349,19 @@
 					if(can_train_combat_skill(H, /datum/skill/combat/unarmed, skill_target))
 						H.mind?.add_sleep_experience(/datum/skill/combat/unarmed, max(round(STAINT*exp_multi), 0), FALSE)
 
-			if(unarmed_bracers)
-				unarmed_bracers.take_damage(INTEG_PARRY_DECAY_NOSHARP, "slash", armor_penetration = 100)
-			else if(unarmed_knuckles)
-				unarmed_knuckles.take_damage(INTEG_PARRY_DECAY_NOSHARP, "slash", armor_penetration = 100)
-			else if(unarmed_bandages)
-				unarmed_bandages.take_damage(INTEG_PARRY_DECAY_NOSHARP, "slash", armor_penetration = 100)
+			if(!clean_block)
+				if(unarmed_bracers)
+					unarmed_bracers.take_damage(INTEG_PARRY_DECAY_NOSHARP, "slash", armor_penetration = 100)
+				else if(unarmed_knuckles)
+					unarmed_knuckles.take_damage(INTEG_PARRY_DECAY_NOSHARP, "slash", armor_penetration = 100)
+				else if(unarmed_bandages)
+					unarmed_bandages.take_damage(INTEG_PARRY_DECAY_NOSHARP, "slash", armor_penetration = 100)
 			flash_fullscreen("blackflash2")
 			return TRUE
 		else
-
 			return FALSE
 
-/mob/proc/do_parry(obj/item/W, parrydrain as num, mob/living/user, untrained_armor = FALSE)
+/mob/proc/do_parry(obj/item/W, parrydrain as num, mob/living/user, untrained_armor = FALSE, clean_block = FALSE)
 	if(ishuman(src))
 		var/mob/living/carbon/human/H = src
 		//Tempo bonus
@@ -362,6 +383,8 @@
 			var/def_msg = "<b>[src]</b> [def_verb] [user][att_verb] with [W]!"
 			if(untrained_armor)
 				def_msg += " Untrained Armor Penalty!"
+			if(clean_block)
+				def_msg = "<b>[src]</b> [pick("expertly", "cleanly", "perfectly")] [def_verb] [user][att_verb] with [W]!"
 
 			visible_message(span_combatsecondary(def_msg), span_boldwarning(def_msg), COMBAT_MESSAGE_RANGE, list(user))
 			to_chat(user, span_boldwarning(def_msg))
@@ -373,11 +396,12 @@
 					L.sate_addiction(/datum/charflaw/addiction/clamorous)
 
 			if(!iscarbon(user))	//Non-carbon mobs never make it to the proper parry proc where the other calculations are done.
-				if(W.max_blade_int)
-					W.remove_bintegrity(SHARPNESS_ONHIT_DECAY, user)
-					W.take_damage(INTEG_PARRY_DECAY, BRUTE, "slash")
-				else
-					W.take_damage(INTEG_PARRY_DECAY_NOSHARP, BRUTE, "slash")
+				if(!clean_block)
+					if(W.max_blade_int)
+						W.remove_bintegrity(SHARPNESS_ONHIT_DECAY, user)
+						W.take_damage(INTEG_PARRY_DECAY, BRUTE, "slash")
+					else
+						W.take_damage(INTEG_PARRY_DECAY_NOSHARP, BRUTE, "slash")
 			return TRUE
 		else
 			to_chat(src, span_warning("I'm too tired to parry!"))
@@ -387,7 +411,9 @@
 			playsound(get_turf(src), pick(W.parrysound), 100, FALSE)
 		return TRUE
 
-/mob/proc/do_unarmed_parry(parrydrain as num, mob/living/user, untrained_armor = FALSE)
+// unarmed_skill: the defender's unarmed skill level, for arm damage reduction on block
+// clean_block: TRUE if they rolled <= half their chance (no arm damage to defender)
+/mob/proc/do_unarmed_parry(parrydrain as num, mob/living/user, untrained_armor = FALSE, unarmed_skill = 0, clean_block = FALSE)
 	if(ishuman(src))
 		var/mob/living/carbon/human/H = src
 		//Tempo bonus
@@ -395,13 +421,30 @@
 
 		if(H.stamina_add(parrydrain))
 			playsound(get_turf(src), pick(parry_sound), 100, FALSE)
-			var/parry_msg = "<b>[src]</b> parries [user]!"
+			var/parry_msg
+			if(clean_block)
+				parry_msg = "<b>[src]</b> cleanly blocks [user]'s attack!"
+			else
+				parry_msg = "<b>[src]</b> parries [user]!"
 			if(untrained_armor)
 				parry_msg += " Untrained Armor Penalty!"
 			src.visible_message(span_warning(parry_msg))
 			if(src.client)
 				record_round_statistic(STATS_PARRIES)
 				log_combat(src, user, "parried")
+
+			// On successful unarmed block: deal damage to attacker's arm (random left/right)
+			// Damage reduced by half unarmed_skill (rounded up)
+			if(ishuman(user))
+				var/mob/living/carbon/human/UH = user
+				var/arm_zone = pick(BODY_ZONE_L_ARM, BODY_ZONE_R_ARM)
+				// Arm damage = base damage mitigated by half unarmed_skill (rounded up)
+				var/block_arm_dmg = 5 // small baseline arm strike damage
+				var/reduction = round(unarmed_skill / 2 + 0.5, 1) // ceil(unarmed_skill/2)
+				block_arm_dmg = max(block_arm_dmg - reduction, 1)
+				if(!clean_block)
+					UH.apply_damage(block_arm_dmg, BRUTE, arm_zone)
+
 			return TRUE
 		else
 			to_chat(src, span_boldwarning("I'm too tired to parry!"))

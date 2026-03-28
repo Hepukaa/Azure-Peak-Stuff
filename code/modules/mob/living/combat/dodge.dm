@@ -60,10 +60,12 @@
 			to_chat(src, span_boldwarning("There's nowhere to dodge to!"))
 			return FALSE
 		else
-			if(do_dodge(user, turfy))
+			var/dodge_result = do_dodge(user, turfy)
+			if(dodge_result)
 				flash_fullscreen("blackflash2")
-				user.aftermiss()
-				return TRUE
+				if(dodge_result != DODGE_PARTIAL)
+					user.aftermiss()
+				return dodge_result
 			else
 				return FALSE
 	else
@@ -92,6 +94,9 @@
 			continue
 		dodge_candidates += dodge_candidate
 	return dodge_candidates
+
+// Return values: FALSE = full hit, DODGE_PARTIAL = half damage, TRUE = full dodge
+#define DODGE_PARTIAL 2
 
 /mob/proc/do_dodge(mob/user, turf/turfy)
 	if(dodgecd)
@@ -169,7 +174,8 @@
 			if(HAS_TRAIT(UH, TRAIT_FENCERDEXTERITY))
 				prob2defend -= 10
 
-		prob2defend = clamp(prob2defend, 5, 90)
+		// Skill cap raised to 99%
+		prob2defend = clamp(prob2defend, 5, 99)
 
 		//------------Dual Wielding Checks------------
 		var/attacker_dualw
@@ -199,22 +205,32 @@
 			if((defender_dualw || attacker_dualw))
 				if(defender_dualw && attacker_dualw)
 					text += " Our dual wielding cancels out!"
-				else//If we're defending against or as a dual wielder, we roll disadv. But if we're both dual wielding it cancels out.
+				else
 					text += " Twice! Disadvantage! ([(prob2defend / 100) * (prob2defend / 100) * 100]%)"
 			to_chat(src, span_info("[text]"))
 
+		// Roll the dodge — store the actual random roll so we can determine margin
+		var/roll = rand(1, 100)
 		var/dodge_status = FALSE
-		if((!defender_dualw && !attacker_dualw) || (defender_dualw && attacker_dualw)) //They cancel each other out
+		var/partial_dodge = FALSE
+
+		if((!defender_dualw && !attacker_dualw) || (defender_dualw && attacker_dualw))
 			if(attacker_feedback)
 				attacker_feedback = "Advantage cancelled out!"
-			if(prob(prob2defend))
+			if(roll <= prob2defend)
 				dodge_status = TRUE
 		else if(attacker_dualw)
-			if(prob(prob2defend))
+			if(roll <= prob2defend)
 				dodge_status = TRUE
 		else if(defender_dualw)
-			if(prob(prob2defend) && extradefroll)
+			if((roll <= prob2defend) && extradefroll)
 				dodge_status = TRUE
+
+		// Partial dodge: succeeded but roll was in upper 10-20% of success band
+		if(dodge_status)
+			var/margin_floor = round(prob2defend * 0.8) // top 20% of success = barely dodged
+			if(roll > margin_floor && roll <= prob2defend)
+				partial_dodge = TRUE
 
 		if(attacker_feedback)
 			to_chat(user, span_info("[attacker_feedback]"))
@@ -231,30 +247,40 @@
 		if(!H.stamina_add(stamdrain))
 			to_chat(src, span_warning("I'm too tired to dodge!"))
 			return FALSE
+
+		// Store partial dodge state on the mob temporarily for damage resolution
+		H.vars["_partial_dodge"] = partial_dodge
+
 	else //we are a non human
-		prob2defend = clamp(prob2defend, 5, 90)
+		prob2defend = clamp(prob2defend, 5, 99)
 		if(client?.prefs.showrolls)
-			to_chat(src, span_info("Roll to dodge... [prob2defend]%"))
+			to_chat(src, span_info("Roll to dodge... [prob2depend]%"))
 		if(!prob(prob2defend))
 			return FALSE
 	dodgecd = TRUE
 	playsound(src, 'sound/combat/dodge.ogg', 100, FALSE)
 	if(!HAS_TRAIT(src, TRAIT_DODGE_NO_MOVE))
 		throw_at(turfy, 1, 2, src, FALSE)
-	if(drained > 0)
+
+	// Determine message and return value based on partial/full dodge
+	var/is_partial = H ? H.vars["_partial_dodge"] : FALSE
+	if(is_partial)
+		src.visible_message(span_warning("<b>[src]</b> barely managed to avoid [user]'s [user.used_intent?.masteritem ? "[user.used_intent.masteritem] attack" : "attack"]!"))
+	else if(drained > 0)
 		src.visible_message(span_warning("<b>[src]</b> dodges [user]'s attack!"))
 	else
 		src.visible_message(span_warning("<b>[src]</b> easily dodges [user]'s attack!"))
+
 	if(get_dist(src, user) <= user.used_intent?.reach)	//We are still in range of the attacker's weapon post-dodge
 		var/probclip = 50
 		var/obj/item/IS = L.get_active_held_item()
 		var/obj/item/IU = U.get_active_held_item()
 		if(IS)
 			if(IS.wlength > WLENGTH_NORMAL)
-				probclip += (IS.wlength - WLENGTH_NORMAL) * 10	//if wlength isn't standardised this might skyrocket it to >100%
+				probclip += (IS.wlength - WLENGTH_NORMAL) * 10
 			else
 				probclip -= (WLENGTH_NORMAL - IS.wlength) * 10
-		var/dist = (user.used_intent?.reach - get_dist(src, user)) - 1 //-1 because we already are in range and triggered this check to begin with.
+		var/dist = (user.used_intent?.reach - get_dist(src, user)) - 1
 		if(dist > 0)
 			probclip += dist * 10
 		if(L.STALUC != U.STALUC)
@@ -273,12 +299,8 @@
 			user.visible_message(span_warning("<b>[user]</b> clips [src]'s weapon!"))
 			playsound(user, 'sound/misc/weapon_clip.ogg', 100)
 	dodgecd = FALSE
-//		if(H)
-//			if(H.IsOffBalanced())
-//				H.Knockdown(1)
-//				to_chat(H, span_danger("I tried to dodge off-balance!"))
-//		if(isturf(loc))
-//			var/turf/T = loc
-//			if(T.landsound)
-//				playsound(T, T.landsound, 100, FALSE)
+	if(is_partial)
+		return DODGE_PARTIAL
 	return TRUE
+
+#undef DODGE_PARTIAL
